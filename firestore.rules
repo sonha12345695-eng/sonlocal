@@ -1,0 +1,38 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isMeetingCreate() {
+      return request.resource.data.keys().hasOnly(['title', 'slots', 'createdAt'])
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 80
+        && request.resource.data.slots is list
+        && request.resource.data.slots.size() > 0
+        && request.resource.data.slots.size() <= 200
+        && request.resource.data.createdAt == request.time;
+    }
+
+    function isParticipantWrite() {
+      return request.resource.data.keys().hasOnly(['name', 'availableSlots', 'updatedAt'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 40
+        && request.resource.data.availableSlots is list
+        && request.resource.data.availableSlots.size() <= 200
+        && request.resource.data.updatedAt == request.time;
+    }
+
+    match /meetings/{meetingId} {
+      allow read: if true;
+      allow create: if isMeetingCreate();
+      allow update, delete: if false;
+
+      match /participants/{participantId} {
+        allow read: if true;
+        allow create, update: if isParticipantWrite();
+        allow delete: if false;
+      }
+    }
+  }
+}
