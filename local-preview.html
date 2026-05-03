@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>모임 일정 체크 미리보기</title>
+    <link rel="stylesheet" href="/src/App.css" />
+    <style>
+      .preview-note {
+        margin: 0 0 16px;
+        border-radius: 8px;
+        padding: 12px 14px;
+        background: #fff7ec;
+        color: #7d4e2d;
+        line-height: 1.6;
+      }
+
+      .config-grid {
+        display: grid;
+        gap: 10px;
+      }
+
+      .config-grid label {
+        display: grid;
+        gap: 6px;
+        color: #51463f;
+        font-weight: 800;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+
+    <script type="module">
+      import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.1.0/firebase-app.js';
+      import {
+        addDoc,
+        collection,
+        doc,
+        getDoc,
+        getFirestore,
+        onSnapshot,
+        orderBy,
+        query,
+        serverTimestamp,
+        setDoc
+      } from 'https://www.gstatic.com/firebasejs/11.1.0/firebase-firestore.js';
+
+      const appRoot = document.querySelector('#app');
+      const configKey = 'meeting-checker-firebase-config';
+      const defaultTimes = ['11:00', '12:00', '13:00', '14:00', '15:00', '16:00', '17:00', '18:00', '19:00'];
+      let firebaseApp = null;
+      let db = null;
+      let unsubscribe = () => {};
+      let createCalendarMonth = new Date();
+      let createSelectedDates = [];
+
+      function html(strings, ...values) {
+        return strings.reduce((result, string, index) => result + string + (values[index] ?? ''), '');
+      }
+
+      function escapeText(value) {
+        return String(value ?? '').replace(/[&<>"']/g, (char) => ({
+          '&': '&amp;',
+          '<': '&lt;',
+          '>': '&gt;',
+          '"': '&quot;',
+          "'": '&#039;'
+        })[char]);
+      }
+
+      function toDateId(date) {
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day}`;
+      }
+
+      function addMonths(date, amount) {
+        return new Date(date.getFullYear(), date.getMonth() + amount, 1);
+      }
+
+      function calendarDays(monthDate) {
+        const firstDay = new Date(monthDate.getFullYear(), monthDate.getMonth(), 1);
+        const start = new Date(firstDay);
+        start.setDate(firstDay.getDate() - firstDay.getDay());
+
+        return Array.from({ length: 42 }, (_, index) => {
+          const day = new Date(start);
+          day.setDate(start.getDate() + index);
+          return {
+            id: toDateId(day),
+            day: day.getDate(),
+            isCurrentMonth: day.getMonth() === monthDate.getMonth(),
+            isToday: toDateId(day) === toDateId(new Date())
+          };
+        });
+      }
+
+      function monthLabel(date) {
+        return new Intl.DateTimeFormat('ko-KR', {
+          year: 'numeric',
+          month: 'long'
+        }).format(date);
+      }
+
+      function getMeetingId() {
+        return location.pathname.match(/^\/m\/([^/]+)/)?.[1] ?? null;
+      }
+
+      function getConfig() {
+        try {
+          return JSON.parse(localStorage.getItem(configKey) ?? 'null');
+        } catch {
+          return null;
+        }
+      }
+
+      function saveConfig(form) {
+        const config = Object.fromEntries(new FormData(form).entries());
+        localStorage.setItem(configKey, JSON.stringify(config));
+        location.reload();
+      }
+
+      function initFirebase() {
+        const config = getConfig();
+        if (!config?.apiKey || !config?.projectId || !config?.appId) {
+          return false;
+        }
+
+        firebaseApp = initializeApp(config);
+        db = getFirestore(firebaseApp);
+        return true;
+      }
+
+      function renderSetup() {
+        appRoot.innerHTML = html`
+          <main class="page-shell centered">
+            <section class="panel setup-panel">
+              <p class="eyebrow">Firebase setup needed</p>
+              <h1>Firebase 값을 한 번만 붙여넣어 주세요.</h1>
+              <p class="preview-note">
+                이 화면은 로컬 미리보기용입니다. Firebase Console의 웹 앱 config 값을 넣으면
+                이 브라우저에 저장되고 바로 모임 앱을 테스트할 수 있습니다.
+              </p>
+              <form id="config-form" class="config-grid">
+                ${['apiKey', 'authDomain', 'projectId', 'storageBucket', 'messagingSenderId', 'appId']
+                  .map((key) => `<label>${key}<input name="${key}" placeholder="${key}" /></label>`)
+                  .join('')}
+                <button class="primary-button" type="submit">Firebase 연결하고 시작</button>
+              </form>
+            </section>
+          </main>
+        `;
+
+        document.querySelector('#config-form').addEventListener('submit', (event) => {
+          event.preventDefault();
+          saveConfig(event.currentTarget);
+        });
+      }
+
+      function participantKey(meetingId) {
+        const key = `meeting-participant-${meetingId}`;
+        const existing = localStorage.getItem(key);
+        if (existing) return existing;
+        const next = crypto.randomUUID();
+        localStorage.setItem(key, next);
+        return next;
+      }
+
+      function renderCreate() {
+        const today = toDateId(new Date());
+        const tomorrowDate = new Date();
+        tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+        const tomorrow = toDateId(tomorrowDate);
+
+        if (createSelectedDates.length === 0) {
+          createSelectedDates = [today, tomorrow];
+        }
+
+        const days = calendarDays(createCalendarMonth);
+        const selectedDateHtml = createSelectedDates
+          .slice()
+          .sort()
+          .map((date) => `<span>${date}</span>`)
+          .join('');
+
+        appRoot.innerHTML = html`
+          <main class="page-shell">
+            <section class="hero">
+              <p class="eyebrow">Local preview</p>
+              <h1>함께 가능한 시간을 모아보세요.</h1>
+              <p>모임을 만들면 공유 링크가 생성되고, 참여자 응답은 Firestore에 저장됩니다.</p>
+            </section>
+            <section class="layout">
+              <form class="panel" id="meeting-form">
+                <div class="panel-heading"><span>1</span><div><h2>새 모임 만들기</h2><p>후보 날짜와 시간을 정하세요.</p></div></div>
+                <label class="field">모임 이름<input name="title" placeholder="예: 5월 팀 저녁 모임" required /></label>
+                <div class="field">후보 날짜
+                  <div class="calendar">
+                    <div class="calendar-toolbar">
+                      <button type="button" id="prev-month">이전</button>
+                      <strong>${monthLabel(createCalendarMonth)}</strong>
+                      <button type="button" id="next-month">다음</button>
+                    </div>
+                    <div class="weekday-grid">${['일', '월', '화', '수', '목', '금', '토'].map((weekday) => `<span>${weekday}</span>`).join('')}</div>
+                    <div class="date-grid">
+                      ${days.map((day) => `<button class="date-button ${day.isCurrentMonth ? '' : 'muted-date'} ${day.isToday ? 'today' : ''} ${createSelectedDates.includes(day.id) ? 'selected' : ''}" data-date="${day.id}" type="button">${day.day}</button>`).join('')}
+                    </div>
+                  </div>
+                  <div class="selected-date-list">${selectedDateHtml || '<p class="muted">달력에서 후보 날짜를 선택해주세요.</p>'}</div>
+                </div>
+                <div class="field">후보 시간<div class="time-grid">
+                  ${defaultTimes.map((time) => `<label class="chip ${['11:00', '14:00', '19:00'].includes(time) ? 'active' : ''}"><input type="checkbox" name="times" value="${time}" ${['11:00', '14:00', '19:00'].includes(time) ? 'checked' : ''} hidden />${time}</label>`).join('')}
+                </div></div>
+                <button class="primary-button" type="submit">공유 링크 만들기</button>
+              </form>
+              <aside class="panel preview">
+                <div class="panel-heading"><span>2</span><div><h2>안내</h2><p>생성 후 /m/모임ID 링크로 이동합니다.</p></div></div>
+                <p class="muted">Firebase 연결이 완료된 상태에서 테스트할 수 있습니다.</p>
+              </aside>
+            </section>
+          </main>
+        `;
+
+        document.querySelectorAll('.chip').forEach((chip) => {
+          chip.addEventListener('click', () => chip.classList.toggle('active'));
+        });
+        document.querySelector('#prev-month').addEventListener('click', () => {
+          createCalendarMonth = addMonths(createCalendarMonth, -1);
+          renderCreate();
+        });
+        document.querySelector('#next-month').addEventListener('click', () => {
+          createCalendarMonth = addMonths(createCalendarMonth, 1);
+          renderCreate();
+        });
+        document.querySelectorAll('.date-button').forEach((button) => {
+          button.addEventListener('click', () => {
+            const dateId = button.dataset.date;
+            createSelectedDates = createSelectedDates.includes(dateId)
+              ? createSelectedDates.filter((date) => date !== dateId)
+              : [...createSelectedDates, dateId];
+            renderCreate();
+          });
+        });
+
+        document.querySelector('#meeting-form').addEventListener('submit', async (event) => {
+          event.preventDefault();
+          const form = event.currentTarget;
+          const data = new FormData(form);
+          const dates = createSelectedDates.slice().sort();
+          const times = data.getAll('times');
+          if (dates.length === 0 || times.length === 0) return;
+          const slots = dates.flatMap((date) => times.map((time) => ({ id: `${date}_${time}`, date, time })));
+          const meeting = await addDoc(collection(db, 'meetings'), {
+            title: data.get('title').trim(),
+            slots,
+            createdAt: serverTimestamp()
+          });
+          location.href = `/m/${meeting.id}`;
+        });
+      }
+
+      async function renderRoom(meetingId) {
+        const snap = await getDoc(doc(db, 'meetings', meetingId));
+        if (!snap.exists()) {
+          appRoot.innerHTML = '<main class="page-shell centered"><section class="panel error-panel">존재하지 않는 모임 링크입니다.</section></main>';
+          return;
+        }
+
+        const meeting = snap.data();
+        const key = participantKey(meetingId);
+        const participantSnap = await getDoc(doc(db, 'meetings', meetingId, 'participants', key));
+        const current = participantSnap.exists() ? participantSnap.data() : {};
+        let selected = current.availableSlots ?? [];
+
+        appRoot.innerHTML = html`
+          <main class="page-shell">
+            <section class="room-header">
+              <button class="ghost-button" id="new-meeting" type="button">새 모임</button>
+              <div><p class="eyebrow">Shared meeting link</p><h1>${escapeText(meeting.title)}</h1><a>${location.href}</a></div>
+            </section>
+            <section class="layout room-layout">
+              <section class="panel">
+                <div class="panel-heading"><span>1</span><div><h2>가능한 시간 체크</h2><p>이름을 입력한 뒤 가능한 시간을 누르세요.</p></div></div>
+                <label class="field">이름<input id="name" value="${escapeText(current.name ?? '')}" placeholder="예: 민지" /></label>
+                <div class="availability-grid">
+                  ${meeting.slots.map((slot) => `<button class="availability-card ${selected.includes(slot.id) ? 'checked' : ''}" data-slot="${slot.id}" type="button"><span>${slot.date}</span><strong>${slot.time}</strong></button>`).join('')}
+                </div>
+              </section>
+              <aside class="panel results">
+                <div class="panel-heading"><span>2</span><div><h2>가장 많이 가능한 시간</h2><p id="count">응답을 불러오는 중...</p></div></div>
+                <div id="results"></div>
+              </aside>
+            </section>
+          </main>
+        `;
+
+        document.querySelector('#new-meeting').addEventListener('click', () => location.href = '/');
+        const nameInput = document.querySelector('#name');
+
+        async function save() {
+          if (!nameInput.value.trim()) return;
+          await setDoc(doc(db, 'meetings', meetingId, 'participants', key), {
+            name: nameInput.value.trim(),
+            availableSlots: selected,
+            updatedAt: serverTimestamp()
+          }, { merge: true });
+        }
+
+        nameInput.addEventListener('blur', save);
+        document.querySelectorAll('.availability-card').forEach((button) => {
+          button.addEventListener('click', async () => {
+            if (!nameInput.value.trim()) return;
+            const slotId = button.dataset.slot;
+            selected = selected.includes(slotId) ? selected.filter((id) => id !== slotId) : [...selected, slotId];
+            button.classList.toggle('checked');
+            await save();
+          });
+        });
+
+        unsubscribe();
+        unsubscribe = onSnapshot(query(collection(db, 'meetings', meetingId, 'participants'), orderBy('updatedAt', 'desc')), (snapshot) => {
+          const people = snapshot.docs.map((item) => item.data());
+          const ranked = meeting.slots.map((slot) => ({
+            ...slot,
+            count: people.filter((person) => person.availableSlots?.includes(slot.id)).length
+          })).sort((a, b) => b.count - a.count || a.date.localeCompare(b.date) || a.time.localeCompare(b.time));
+          const best = ranked[0]?.count ?? 0;
+          document.querySelector('#count').textContent = `${people.length}명이 응답했습니다.`;
+          document.querySelector('#results').innerHTML = best > 0
+            ? `<div class="best-list">${ranked.filter((slot) => slot.count === best).map((slot) => `<div class="best-card"><span>${slot.count}명 가능</span><strong>${slot.date} ${slot.time}</strong></div>`).join('')}</div><div class="rank-list">${ranked.map((slot) => `<div class="rank-row"><span>${slot.date} ${slot.time}</span><strong>${slot.count}</strong></div>`).join('')}</div>`
+            : '<p class="muted">아직 체크된 시간이 없어요.</p>';
+        });
+      }
+
+      if (!initFirebase()) {
+        renderSetup();
+      } else {
+        const meetingId = getMeetingId();
+        meetingId ? renderRoom(meetingId) : renderCreate();
+      }
+    </script>
+  </body>
+</html>
